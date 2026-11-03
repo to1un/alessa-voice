@@ -40,7 +40,7 @@ max_minutes = 60              # recording limit
 warn_minutes = 50             # from here the voicebox turns red and pulses; a chime at limit-5
 on_limit = "transcribe"       # "transcribe" or "discard" when the limit is reached
 sounds = true                 # start/stop/warning tones
-duck = 0.2                    # system volume while recording (fraction of current, 1 = off)
+duck = 0.30                   # loudness of playing media while recording (0-1, 1 = off)
 paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
 margin = 28                   # px from the screen edge
@@ -124,22 +124,32 @@ def get_volume():
     return float(out.split()[1])
 
 
-def set_volume(v):
-    subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{v:.3f}"])
-
-
-def duck(fraction):
-    if fraction >= 1 or DUCK_FILE.exists():
+def duck(level):
+    """Turn playing apps down (not the system volume, so Plasma shows no OSD) until unduck()."""
+    if level >= 1 or DUCK_FILE.exists():
         return
-    v = get_volume()
-    DUCK_FILE.write_text(str(v))  # survives a crash, restored on next start
-    set_volume(v * fraction)
+    factor = min(1.0, level / max(get_volume(), 0.01))
+    if factor >= 1:
+        return
+    streams = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
+                                        capture_output=True, text=True).stdout or "[]")
+    saved = {}
+    for st in streams:
+        if st["properties"].get("application.process.id") == str(os.getpid()):
+            continue
+        vols = [ch["value"] for ch in st["volume"].values()]
+        saved[st["index"]] = vols
+        subprocess.run(["pactl", "set-sink-input-volume", str(st["index"]), *[str(int(v * factor)) for v in vols]])
+    DUCK_FILE.write_text(json.dumps(saved))  # survives a crash, restored on next start
 
 
 def unduck():
-    if DUCK_FILE.exists():
-        set_volume(float(DUCK_FILE.read_text()))
-        DUCK_FILE.unlink()
+    if not DUCK_FILE.exists():
+        return
+    for idx, vols in json.loads(DUCK_FILE.read_text()).items():
+        subprocess.run(["pactl", "set-sink-input-volume", idx, *map(str, vols)],
+                       stderr=subprocess.DEVNULL)  # the stream may be gone by now
+    DUCK_FILE.unlink()
 
 
 def post_wav(port, path, language):
@@ -182,7 +192,9 @@ def run_daemon():
 
     server = subprocess.Popen(
         ["whisper-server", "-m", str(MODEL_DIR / cfg["model"]), "--host", "127.0.0.1",
-         "--port", str(cfg["port"]), "-l", cfg["language"], "-mc", "0", "-sns"],
+         "--port", str(cfg["port"]), "-l", cfg["language"], "-mc", "0", "-sns",
+         # Silero VAD: only speech reaches Whisper, so silence can't turn into invented subtitles
+         "--vad", "-vm", str(MODEL_DIR / "vad/ggml-silero-v5.1.2.bin"), "-vt", "0.35", "-vp", "400", "-vsd", "300"],
         stdout=open(CACHE / "whisper-server.log", "w"), stderr=subprocess.STDOUT)
 
     def server_ready():
@@ -192,11 +204,12 @@ def run_daemon():
         except OSError:
             return False
 
-    AMBER, RED = QColor(255, 150, 20), QColor(255, 30, 30)
+    RED, HOT = (255, 36, 56), (255, 110, 30)
 
     class Voicebox(QWidget):
-        """KITT-style voice box: three LED columns, the middle one taller."""
-        W, H = 112, 62
+        """KITT-style voice box: a row of LED columns rippling out from the centre, ALESSA below."""
+        COLS, SEGS, SW, GAP, SH, SGAP = 21, 7, 7, 5, 3, 2
+        W, H = 21 * 12 + 16, 66
 
         def __init__(self):
             super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
@@ -210,8 +223,9 @@ def run_daemon():
             self.warn = 0.0         # 0..1 how close to the limit
             self.minutes_left = None
             self.t0 = time.monotonic()
-            self.opacity = 1.0
-            self.timer = QTimer(self, interval=33, timeout=self.update)
+            # LED brightness persists between frames so lights fade like lamps instead of blinking
+            self.leds = [[0.0] * self.SEGS for _ in range(self.COLS)]
+            self.timer = QTimer(self, interval=16, timeout=self.update)
 
         def place(self):
             geo = QApplication.primaryScreen().geometry()
@@ -223,78 +237,65 @@ def run_daemon():
             if state == "idle":
                 self.timer.stop()
                 self.hide()
+                self.leds = [[0.0] * self.SEGS for _ in range(self.COLS)]
                 return
             self.place()
             self.show()
             self.timer.start()
 
-        def color(self):
-            c = AMBER if self.state != "error" else RED
+        def rgb(self):
+            if self.state == "error":
+                return RED
             if self.warn > 0:
-                pulse = 0.5 + 0.5 * math.sin(time.monotonic() * (2 + 4 * self.warn))
-                k = min(1.0, self.warn)
-                c = QColor(int(AMBER.red() + (RED.red() - AMBER.red()) * k),
-                           int(AMBER.green() + (RED.green() - AMBER.green()) * k),
-                           int(AMBER.blue() + (RED.blue() - AMBER.blue()) * k))
-                c = c.lighter(100 + int(40 * pulse * k))
-            return c
+                k = min(1.0, self.warn) * (0.5 + 0.5 * math.sin(time.monotonic() * 5))
+                return tuple(int(r + (h - r) * k) for r, h in zip(RED, HOT))
+            return RED
+
+        def column_target(self, i, t):
+            n = self.COLS
+            d = abs(i - (n - 1) / 2) / ((n - 1) / 2)
+            if self.state == "thinking":
+                # two lights start at the edges, meet in the middle, then spread back out
+                ph = (math.sin(t * 4.2) + 1) / 2
+                return max(0.0, 1 - abs((1 - d) - ph) * 4.5) * 0.9
+            if self.state == "done":
+                return 1.0
+            if self.state == "error":
+                return 1.0 if int(t * 6) % 2 == 0 else 0.0
+            return self.level * (1 - d * 0.7) * (0.82 + 0.18 * math.sin(t * 7 - d * 5))
 
         def paintEvent(self, _):
             t = time.monotonic() - self.t0
-            p = QPainter(self)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
             alpha = 1.0
             if self.state in ("done", "error"):
                 alpha = max(0.0, 1.0 - t / 0.9)
                 if alpha == 0:
                     self.set_state("idle")
                     return
+            p = QPainter(self)
             p.setOpacity(alpha)
-            c = self.color()
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(8, 8, 10, 215))
-            p.drawRoundedRect(QRectF(0.5, 0.5, self.W - 1, self.H - 1), 12, 12)
-            border = QColor(c)
-            border.setAlpha(70)
-            p.setPen(border)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(QRectF(0.5, 0.5, self.W - 1, self.H - 1), 12, 12)
-            p.setPen(Qt.PenStyle.NoPen)
-
-            seg_w, seg_h, gap = 16, 3, 2
-            xs = [self.W / 2 - seg_w * 1.5 - 9, self.W / 2 - seg_w / 2, self.W / 2 + seg_w / 2 + 9]
-            counts = [5, 9, 5]
-            cy = self.H / 2
-            if self.state == "listening":
-                levels = [self.level * 0.75, self.level, self.level * 0.75]
-            elif self.state == "thinking":
-                # Larson scanner: a light sweeping across the three columns
-                pos = (math.sin(t * 3.2) + 1) / 2 * 2
-                levels = [max(0.0, 1 - abs(pos - i) * 0.9) * 0.6 for i in range(3)]
-            elif self.state == "done":
-                levels = [1.0, 1.0, 1.0]
-            else:
-                levels = [1.0, 1.0, 1.0] if int(t * 6) % 2 == 0 else [0, 0, 0]
-            for x, n, lv in zip(xs, counts, levels):
-                lit = lv * (n / 2 + 0.5)
-                for i in range(n):
-                    dist = abs(i - (n - 1) / 2)
-                    on = dist < lit
-                    sc = QColor(c)
-                    sc.setAlpha(255 if on else 34)
-                    y = cy + (i - (n - 1) / 2) * (seg_h + gap) - seg_h / 2
-                    if on:
-                        glow = QColor(c)
-                        glow.setAlpha(60)
-                        p.setBrush(glow)
-                        p.drawRoundedRect(QRectF(x - 2, y - 2, seg_w + 4, seg_h + 4), 3, 3)
-                    p.setBrush(sc)
-                    p.drawRoundedRect(QRectF(x, y, seg_w, seg_h), 1.5, 1.5)
-            if self.minutes_left is not None:
-                p.setPen(c)
-                p.setFont(QFont("monospace", 7))
-                p.drawText(QRectF(0, self.H - 13, self.W - 8, 11),
-                           Qt.AlignmentFlag.AlignRight, f"{self.minutes_left}m")
+            r, g, b = self.rgb()
+            n, segs = self.COLS, self.SEGS
+            cx, cy = self.W / 2, 24
+            for i in range(n):
+                v = self.column_target(i, t)
+                x = cx + (i - (n - 1) / 2) * (self.SW + self.GAP) - self.SW / 2
+                for j in range(segs):
+                    dj = abs(j - (segs - 1) / 2) / ((segs - 1) / 2 + 0.5)
+                    target = max(0.0, min(1.0, (v * 1.25 - dj) * 3))
+                    cur = self.leds[i][j]
+                    cur += (target - cur) * (0.45 if target > cur else 0.10)
+                    self.leds[i][j] = cur
+                    p.setBrush(QColor(r, g, b, int(255 * (0.10 + 0.90 * cur))))
+                    y = cy + (j - (segs - 1) / 2) * (self.SH + self.SGAP) - self.SH / 2
+                    p.drawRect(QRectF(x, y, self.SW, self.SH))
+            p.setPen(QColor(128, 128, 134))  # neutral: readable on light and dark windows
+            f = QFont("sans-serif", 8, QFont.Weight.Medium)
+            f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 5)
+            p.setFont(f)
+            label = "ALESSA" if self.minutes_left is None else f"ALESSA · {self.minutes_left}m"
+            p.drawText(QRectF(0, cy + 24, self.W, 16), Qt.AlignmentFlag.AlignHCenter, label)
             p.end()
 
     class Daemon(QObject):
@@ -337,7 +338,6 @@ def run_daemon():
                 return
             self.raw = open(self.raw_path, "wb")
             self.peak_db, self.warned, self.box.warn, self.box.minutes_left = -120.0, False, 0.0, None
-            self.frames = []  # (byte offset, dB) per audio chunk, to trim silent ends
             self.rec = QProcess(self)
             self.rec.readyReadStandardOutput.connect(self.on_audio)
             self.rec.start("parecord", ["--raw", "--format=s16le", f"--rate={RATE}", "--channels=1",
@@ -352,13 +352,11 @@ def run_daemon():
             data = bytes(self.rec.readAllStandardOutput())
             if not data:
                 return
-            self.frames.append((self.raw.tell(), None))
             self.raw.write(data)
             samples = array.array("h", data[: len(data) // 2 * 2])
             rms = math.sqrt(sum(s * s for s in samples) / max(1, len(samples)))
             db = 20 * math.log10(max(rms, 1) / 32768)
             self.peak_db = max(self.peak_db, db)
-            self.frames[-1] = (self.frames[-1][0], db)
             target = min(1.0, max(0.0, (db + 52) / 34))
             k = 0.6 if target > self.box.level else 0.15  # fast attack, slow decay
             self.box.level += (target - self.box.level) * k
@@ -384,16 +382,6 @@ def run_daemon():
             self.raw.close()
             self.rec = None
 
-        def trimmed(self, data):
-            """Cut leading/trailing silence (keeping 0.4 s), where Whisper invents subtitles."""
-            voiced = [off for off, db in self.frames if db is not None and db > -45]
-            if not voiced:
-                return data
-            pad = int(0.4 * RATE) * 2
-            start = max(0, voiced[0] - pad)
-            end = min(len(data), voiced[-1] + pad + 4096)
-            return data[start - start % 2:end - end % 2]
-
         def cancel(self):
             if not self.rec:
                 return
@@ -417,7 +405,7 @@ def run_daemon():
                 w.setnchannels(1)
                 w.setsampwidth(2)
                 w.setframerate(RATE)
-                w.writeframes(self.trimmed(self.raw_path.read_bytes()))
+                w.writeframes(self.raw_path.read_bytes())
             self.raw_path.unlink(missing_ok=True)
             self.busy = True
             self.box.set_state("thinking")
