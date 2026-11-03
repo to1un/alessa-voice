@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>alessa-voice</title>
+<meta name="description" content="Minimal local voice dictation for KDE Plasma (Wayland).">
+<style>
+  :root {
+    --bg: #f6f6f7; --fg: #1b1b1f; --muted: #5d5d66; --card: #ffffff; --line: #e2e2e6;
+    --code: #efeff2; --accent: #ff2438; --desk: #dcdde3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111114; --fg: #ececf0; --muted: #9a9aa5; --card: #1b1b20; --line: #2a2a31; --code: #1f1f25; --desk: #232329; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 80px; }
+  h1 { font-size: 2.2rem; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 { font-size: 1.15rem; margin: 48px 0 12px; }
+  p.lead { color: var(--muted); font-size: 1.15rem; margin: 0 0 32px; }
+  a { color: var(--accent); }
+  code, pre { font: 14px/1.5 ui-monospace, monospace; background: var(--code); border-radius: 6px; }
+  code { padding: 1px 5px; }
+  pre { padding: 12px 14px; overflow-x: auto; }
+
+  /* the demo: a desktop with one window and the voicebox on top */
+  .stage { position: relative; background: var(--desk); border-radius: 12px; height: 300px; overflow: hidden; border: 1px solid var(--line); }
+  .win { position: absolute; left: 50%; bottom: 28px; transform: translateX(-50%); width: min(560px, calc(100% - 32px));
+         background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.12); }
+  .bar { height: 30px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 6px; padding: 0 12px; }
+  .bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
+  .input { margin: 14px; min-height: 64px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; color: var(--fg); font-size: 15px; }
+  .input .ph { color: var(--muted); }
+  .caret { display: inline-block; width: 1px; height: 1.1em; background: var(--fg); vertical-align: text-bottom; margin-left: 1px; }
+  .key { position: absolute; right: 14px; top: 12px; font: 12px ui-monospace, monospace; color: var(--muted);
+         border: 1px solid var(--line); border-radius: 5px; padding: 1px 7px; background: var(--card); opacity: 0; transition: opacity .2s; }
+  .key.on { opacity: 1; }
+  #box { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); }
+
+  ol.how { padding-left: 20px; } ol.how li { margin: 6px 0; }
+  table { border-collapse: collapse; width: 100%; } td { border-top: 1px solid var(--line); padding: 8px 6px; vertical-align: top; }
+  footer { margin-top: 64px; color: var(--muted); font-size: 14px; }
+
+  body.capture { background: transparent; } body.capture main > :not(.stage) { display: none; }
+  body.capture main { padding: 0; max-width: none; } body.capture .stage { width: 760px; border-radius: 0; border: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>alessa-voice</h1>
+  <p class="lead">Press a key, talk, press it again: the text is pasted where your cursor is. Fully local, for KDE Plasma on Wayland.</p>
+
+  <div class="stage" aria-label="Animated demo: the voice box listens, thinks, then the text appears in the input">
+    <canvas id="box"></canvas>
+    <span class="key" id="key">F8</span>
+    <div class="win">
+      <div class="bar"><i></i><i></i><i></i></div>
+      <div class="input" id="input"><span class="ph">Message…</span><span class="caret"></span></div>
+    </div>
+  </div>
+
+  <h2>How it works</h2>
+  <ol class="how">
+    <li><b>F8</b>: the voice box appears and its LEDs follow your voice. Playing media is turned down.</li>
+    <li><b>F8</b> again: two lights meet in the middle while whisper.cpp transcribes on your GPU.</li>
+    <li>The text is pasted at the cursor and the volume comes back. <b>Ctrl+F8</b> discards instead.</li>
+  </ol>
+
+  <h2>Requirements</h2>
+  <p>KDE Plasma 6 (Wayland), a GPU with Vulkan, <code>whisper-cpp</code>, <code>python-pyqt6</code>, <code>layer-shell-qt</code>, <code>pipewire</code>, <code>wl-clipboard</code>, <code>ydotool</code>.</p>
+
+  <h2>Install</h2>
+<pre>git clone https://github.com/to1un/alessa-voice ~/projects/alessa-voice
+ln -s ~/projects/alessa-voice/alessa_voice.py ~/.local/bin/alessa-voice
+alessa-voice &amp;</pre>
+  <p>Then bind <code>alessa-voice toggle</code> and <code>alessa-voice cancel</code> to global shortcuts. Full steps in the <a href="https://github.com/to1un/alessa-voice#readme">README</a>.</p>
+
+  <footer>MIT · <a href="https://github.com/to1un/alessa-voice">GitHub</a> · <a href="https://to1un.com">to1un.com</a></footer>
+</main>
+<script src="voicebox.js"></script>
+<script>
+  const TEXT = "Summarize today's notes and draft the commit message.";
+  const box = Voicebox.make(document.getElementById('box'), { scale: 3 });
+  const input = document.getElementById('input'), key = document.getElementById('key');
+  const T = Voicebox.T;
+  let shown = null;
+
+  function frame(t) {
+    t = ((t % T.end) + T.end) % T.end;
+    box.render(t);
+    // the key badge flashes on each press: start, stop
+    key.classList.toggle('on', (t > T.listen - 0.35 && t < T.listen + 0.15) || (t > T.think - 0.35 && t < T.think + 0.15));
+    const pasted = t >= T.done + 0.1;
+    if (pasted !== shown) {
+      shown = pasted;
+      input.innerHTML = pasted ? TEXT + '<span class="caret"></span>' : '<span class="ph">Message…</span><span class="caret"></span>';
+    }
+  }
+
+  window.renderAt = frame;  // used by the capture script
+  if (new URLSearchParams(location.search).has('capture')) {
+    document.body.classList.add('capture');
+  } else if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    frame(3.2);  // one still frame while listening
+  } else {
+    const t0 = performance.now();
+    (function loop(now) { frame((now - t0) / 1000); requestAnimationFrame(loop); })(t0);
+  }
+</script>
+</body>
+</html>
