@@ -43,7 +43,7 @@ sounds = true                 # start/stop/warning tones
 duck = 0.30                   # loudness of playing media while recording (0-1, 1 = off)
 paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
-margin = 28                   # px from the screen edge
+margin = 110                  # px from the screen edge
 port = 45556                  # local whisper-server port
 """
 
@@ -174,7 +174,15 @@ def post_wav(port, path, language):
 def run_daemon():
     if send("ping"):
         sys.exit("alessa-voice is already running")
-    os.environ["QT_QPA_PLATFORM"] = "xcb"  # XWayland: lets the overlay sit on every desktop, at a fixed spot
+    import ctypes
+    try:
+        # Native Wayland layer-shell: the overlay sits in KWin's top-most layer, above every window
+        lsq = ctypes.CDLL("libLayerShellQtInterface.so.6")
+        lsq._ZN12LayerShellQt5Shell13useLayerShellEv()
+        lsq._ZN12LayerShellQt6Window3getEP7QWindow.restype = ctypes.c_void_p
+    except OSError:
+        lsq = None
+        os.environ["QT_QPA_PLATFORM"] = "xcb"  # fallback: XWayland override-redirect window
 
     from PyQt6.QtCore import QObject, QProcess, QRectF, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QColor, QFont, QPainter
@@ -226,6 +234,21 @@ def run_daemon():
             # LED brightness persists between frames so lights fade like lamps instead of blinking
             self.leds = [[0.0] * self.SEGS for _ in range(self.COLS)]
             self.timer = QTimer(self, interval=16, timeout=self.update)
+            if lsq:
+                self.layer_shell()
+
+        def layer_shell(self):
+            from PyQt6 import sip
+            self.winId()
+            win = ctypes.c_void_p(lsq._ZN12LayerShellQt6Window3getEP7QWindow(
+                ctypes.c_void_p(sip.unwrapinstance(self.windowHandle()))))
+            top = cfg["position"] == "top"
+            margins = (ctypes.c_int * 4)(0, cfg["margin"] if top else 0, 0, 0 if top else cfg["margin"])
+            lsq._ZN12LayerShellQt6Window8setLayerENS0_5LayerE(win, 3)                     # overlay
+            lsq._ZN12LayerShellQt6Window10setAnchorsE6QFlagsINS0_6AnchorEE(win, 1 if top else 2)
+            lsq._ZN12LayerShellQt6Window10setMarginsERK8QMargins(win, margins)
+            lsq._ZN12LayerShellQt6Window24setKeyboardInteractivityENS0_21KeyboardInteractivityE(win, 0)
+            lsq._ZN12LayerShellQt6Window16setExclusiveZoneEi(win, -1)                  # ignore panels
 
         def place(self):
             geo = QApplication.primaryScreen().geometry()
@@ -287,7 +310,9 @@ def run_daemon():
                     cur = self.leds[i][j]
                     cur += (target - cur) * (0.45 if target > cur else 0.10)
                     self.leds[i][j] = cur
-                    p.setBrush(QColor(r, g, b, int(255 * (0.10 + 0.90 * cur))))
+                    if cur < 0.02:
+                        continue
+                    p.setBrush(QColor(r, g, b, int(255 * cur)))
                     y = cy + (j - (segs - 1) / 2) * (self.SH + self.SGAP) - self.SH / 2
                     p.drawRect(QRectF(x, y, self.SW, self.SH))
             p.setPen(QColor(128, 128, 134))  # neutral: readable on light and dark windows
