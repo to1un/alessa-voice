@@ -4,8 +4,7 @@ Minimal local voice dictation for KDE Plasma (Wayland). Press a key, talk, press
 
 Built for talking to an AI assistant without staring at an empty screen: a KITT-style voice box (yes, Knight Rider) listens while you speak.
 
-![Listening](docs/listening.png)
-![Thinking](docs/thinking.png)
+![alessa-voice demo](docs/demo.gif)
 
 ## Features
 
