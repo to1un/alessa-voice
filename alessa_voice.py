@@ -316,7 +316,7 @@ def run_daemon():
                     y = cy + (j - (segs - 1) / 2) * (self.SH + self.SGAP) - self.SH / 2
                     p.drawRect(QRectF(x, y, self.SW, self.SH))
             p.setPen(QColor(128, 128, 134))  # neutral: readable on light and dark windows
-            f = QFont("sans-serif", 10, QFont.Weight.DemiBold)
+            f = QFont("sans-serif", 11, QFont.Weight.DemiBold)
             f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 5)
             p.setFont(f)
             label = "ALESSA" if self.minutes_left is None else f"ALESSA · {self.minutes_left}m"
