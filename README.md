@@ -1,29 +1,31 @@
 # alessa-voice
 
-Minimal local voice dictation for KDE Plasma (Wayland). Press a key, talk, press it again: the text is pasted where your cursor is.
-
-Built for talking to an AI assistant without staring at an empty screen: a KITT-style voice box (yes, Knight Rider) listens while you speak.
+Local voice dictation for KDE Plasma (Wayland): press a key, talk, press it again, and the text is pasted at your cursor.
 
 ![alessa-voice demo](docs/demo.gif)
 
-## Features
+While you talk, a voice box at the top of the screen follows your voice; playing media is turned down until the text is pasted. Transcription runs on your own GPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp); nothing leaves the machine.
 
-- **Fully local**: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-server` on the GPU (Vulkan), model kept loaded.
-- **Voice box overlay** in KWin's top layer: LEDs follow your voice, two lights meet in the middle while transcribing. Never steals focus or clicks.
-- **Radio-style ducking**: playing media is turned down to 30% while you talk (per app, so no volume popup) and restored after the text is pasted.
-- **Long recordings**: 60 min limit by default; from minute 50 the box turns hot and pulses, a chime at 55. At the limit it transcribes (or discards, if you prefer).
-- **Fewer hallucinations**: Silero VAD, no text context carry-over (stops repeat loops), filter for invented YouTube-subtitle phrases.
-- The last recording is kept in `~/.cache/alessa-voice/last.wav` until the next one.
+Website: https://to1un.github.io/alessa-voice/
 
-## Install (Arch / CachyOS)
+## Requirements
+
+- KDE Plasma 6 on Wayland
+- A GPU with Vulkan (whisper.cpp built with the Vulkan backend)
+- `python-pyqt6`, `layer-shell-qt`, `whisper-cpp`, `libpulse`, `pipewire`, `wl-clipboard`, `ydotool`
+
+## Install
+
+On Arch / CachyOS:
 
 ```bash
 sudo pacman -S python-pyqt6 layer-shell-qt whisper-cpp libpulse pipewire wl-clipboard ydotool
 systemctl --user enable --now ydotool
-# whisper-cpp must be built with the Vulkan backend (CachyOS/Arch extra: yes)
 ```
 
-Models go in `~/.local/share/whisper/`:
+`ydotool` needs write access to `/dev/uinput` (the `input` group or a udev rule).
+
+Download the models:
 
 ```bash
 mkdir -p ~/.local/share/whisper/vad
@@ -31,28 +33,27 @@ curl -L -o ~/.local/share/whisper/ggml-large-v3.bin https://huggingface.co/ggerg
 curl -L -o ~/.local/share/whisper/vad/ggml-silero-v5.1.2.bin https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
 ```
 
-Then:
+Install alessa-voice:
 
 ```bash
 git clone https://github.com/to1un/alessa-voice ~/projects/alessa-voice
 ln -s ~/projects/alessa-voice/alessa_voice.py ~/.local/bin/alessa-voice
-alessa-voice &
 ```
 
-Bind two global shortcuts in *System Settings → Keyboard → Shortcuts → Add New → Command*: `alessa-voice toggle` (e.g. F8) and `alessa-voice cancel` (e.g. Ctrl+F8). Add `alessa-voice` to autostart.
-
-`ydotool` needs write access to `/dev/uinput` (the `input` group or a udev rule).
+In *System Settings → Keyboard → Shortcuts → Add New → Command*, bind `alessa-voice toggle` (e.g. F8) and `alessa-voice cancel` (e.g. Ctrl+F8). Add `alessa-voice` to *Autostart*.
 
 ## Usage
 
-| | |
+| Command | |
 |---|---|
 | `alessa-voice` | run the daemon |
 | `alessa-voice toggle` | start / stop recording |
 | `alessa-voice cancel` | discard the recording |
 | `alessa-voice models` | list local models |
 
-Settings live in `~/.config/alessa-voice/config.toml` (created on first run): model, language, limit and warning minutes, ducking level, position, sounds.
+Settings are in `~/.config/alessa-voice/config.toml`, created on first run. The default language is Turkish (`language = "tr"`); set `"en"` or `"auto"`. Other settings: model, recording limit (60 min) and warning, media volume while recording, position, sounds.
+
+The last recording is kept in `~/.cache/alessa-voice/last.wav` until the next one.
 
 ## License
 
