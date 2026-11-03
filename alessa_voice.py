@@ -40,6 +40,7 @@ max_minutes = 60              # recording limit
 warn_minutes = 50             # from here the voicebox turns red and pulses; a chime at limit-5
 on_limit = "transcribe"       # "transcribe" or "discard" when the limit is reached
 sounds = true                 # start/stop/warning tones
+duck = 0.2                    # system volume while recording (fraction of current, 1 = off)
 paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
 margin = 28                   # px from the screen edge
@@ -92,6 +93,17 @@ def make_tone(path, notes, vol=0.18):
         w.writeframes(data.tobytes())
 
 
+# Phrases Whisper learned from YouTube subtitles and invents on silence or noise.
+HALLUCINATIONS = re.compile(
+    r"abone ol|altyaz[ıi]|izledi[gğ]iniz i[cç]in te[sş]ekk|be[gğ]enmeyi unutmay|kanal[ıi]ma|"
+    r"bir sonraki videoda|subtitles? by|thanks? for watching|amara\.org|please subscribe", re.I)
+
+
+def drop_hallucinations(text):
+    parts = re.split(r"(?<=[.!?…])\s+", text)
+    return " ".join(p for p in parts if not (HALLUCINATIONS.search(p) and len(p) < 60))
+
+
 def collapse_repeats(text):
     """Drop Whisper's hallucination loops: the same sentence repeated back to back."""
     parts = re.split(r"(?<=[.!?…])\s+", " ".join(text.split()))
@@ -102,6 +114,32 @@ def collapse_repeats(text):
             continue
         out.append(p)
     return " ".join(out)
+
+
+DUCK_FILE = CACHE / "volume-before-duck"
+
+
+def get_volume():
+    out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True, text=True).stdout
+    return float(out.split()[1])
+
+
+def set_volume(v):
+    subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{v:.3f}"])
+
+
+def duck(fraction):
+    if fraction >= 1 or DUCK_FILE.exists():
+        return
+    v = get_volume()
+    DUCK_FILE.write_text(str(v))  # survives a crash, restored on next start
+    set_volume(v * fraction)
+
+
+def unduck():
+    if DUCK_FILE.exists():
+        set_volume(float(DUCK_FILE.read_text()))
+        DUCK_FILE.unlink()
 
 
 def post_wav(port, path, language):
@@ -135,6 +173,7 @@ def run_daemon():
 
     cfg = load_config()
     CACHE.mkdir(parents=True, exist_ok=True)
+    unduck()
     tones = {"start": [(660, 0.07), (880, 0.10)], "stop": [(880, 0.07), (660, 0.10)],
              "warn": [(988, 0.12), (0, 0.08), (988, 0.12), (0, 0.08), (988, 0.18)],
              "error": [(330, 0.25)]}
@@ -298,6 +337,7 @@ def run_daemon():
                 return
             self.raw = open(self.raw_path, "wb")
             self.peak_db, self.warned, self.box.warn, self.box.minutes_left = -120.0, False, 0.0, None
+            self.frames = []  # (byte offset, dB) per audio chunk, to trim silent ends
             self.rec = QProcess(self)
             self.rec.readyReadStandardOutput.connect(self.on_audio)
             self.rec.start("parecord", ["--raw", "--format=s16le", f"--rate={RATE}", "--channels=1",
@@ -306,16 +346,19 @@ def run_daemon():
             self.clock.start()
             self.box.set_state("listening")
             self.play("start")
+            QTimer.singleShot(250, lambda: duck(cfg["duck"]) if self.rec else None)
 
         def on_audio(self):
             data = bytes(self.rec.readAllStandardOutput())
             if not data:
                 return
+            self.frames.append((self.raw.tell(), None))
             self.raw.write(data)
             samples = array.array("h", data[: len(data) // 2 * 2])
             rms = math.sqrt(sum(s * s for s in samples) / max(1, len(samples)))
             db = 20 * math.log10(max(rms, 1) / 32768)
             self.peak_db = max(self.peak_db, db)
+            self.frames[-1] = (self.frames[-1][0], db)
             target = min(1.0, max(0.0, (db + 52) / 34))
             k = 0.6 if target > self.box.level else 0.15  # fast attack, slow decay
             self.box.level += (target - self.box.level) * k
@@ -341,11 +384,22 @@ def run_daemon():
             self.raw.close()
             self.rec = None
 
+        def trimmed(self, data):
+            """Cut leading/trailing silence (keeping 0.4 s), where Whisper invents subtitles."""
+            voiced = [off for off, db in self.frames if db is not None and db > -45]
+            if not voiced:
+                return data
+            pad = int(0.4 * RATE) * 2
+            start = max(0, voiced[0] - pad)
+            end = min(len(data), voiced[-1] + pad + 4096)
+            return data[start - start % 2:end - end % 2]
+
         def cancel(self):
             if not self.rec:
                 return
             self.end_recording()
             self.raw_path.unlink(missing_ok=True)
+            unduck()
             self.play("stop")
             self.box.set_state("error")
 
@@ -355,6 +409,7 @@ def run_daemon():
             self.end_recording()
             self.play("stop")
             if self.peak_db < -50:  # nothing but silence: Whisper would only invent text
+                unduck()
                 self.box.set_state("error")
                 return
             wav = CACHE / "last.wav"  # kept until the next recording, so nothing is lost on failure
@@ -362,7 +417,7 @@ def run_daemon():
                 w.setnchannels(1)
                 w.setsampwidth(2)
                 w.setframerate(RATE)
-                w.writeframes(self.raw_path.read_bytes())
+                w.writeframes(self.trimmed(self.raw_path.read_bytes()))
             self.raw_path.unlink(missing_ok=True)
             self.busy = True
             self.box.set_state("thinking")
@@ -374,13 +429,14 @@ def run_daemon():
                     if server.poll() is not None:
                         raise RuntimeError("whisper-server exited, see ~/.cache/alessa-voice/whisper-server.log")
                     time.sleep(0.3)
-                text = collapse_repeats(post_wav(cfg["port"], wav, cfg["language"]))
+                text = drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, cfg["language"])))
                 self.transcribed.emit(text, "")
             except Exception as e:
                 self.transcribed.emit("", str(e))
 
         def on_transcribed(self, text, error):
             self.busy = False
+            unduck()
             if error or not text:
                 print("transcription failed:", error or "empty result", file=sys.stderr)
                 self.play("error")
