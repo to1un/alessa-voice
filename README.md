@@ -6,8 +6,6 @@ Local voice dictation for KDE Plasma (Wayland): press a key, talk, press it agai
 
 While you talk, a voice box at the top of the screen follows your voice; playing media is turned down until the text is pasted. Transcription runs on your own GPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp); nothing leaves the machine.
 
-Website: https://to1un.github.io/alessa-voice/
-
 ## Requirements
 
 - KDE Plasma 6 on Wayland
