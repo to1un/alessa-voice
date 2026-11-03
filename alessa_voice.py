@@ -320,7 +320,13 @@ def run_daemon():
             f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 5)
             p.setFont(f)
             label = "ALESSA" if self.minutes_left is None else f"ALESSA · {self.minutes_left}m"
-            p.drawText(QRectF(0, cy + 24, self.W, 16), Qt.AlignmentFlag.AlignHCenter, label)
+            # halo: a soft light outline keeps the label readable over any text or window behind it
+            from PyQt6.QtGui import QFontMetricsF, QPainterPath, QPen
+            path = QPainterPath()
+            path.addText((self.W - QFontMetricsF(f).horizontalAdvance(label)) / 2, cy + 36, f, label)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.strokePath(path, QPen(QColor(255, 255, 255, 230), 3.5))
+            p.fillPath(path, QColor(110, 110, 116))
             p.end()
 
     class Daemon(QObject):
