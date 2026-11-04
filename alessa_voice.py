@@ -41,6 +41,7 @@ warn_minutes = 50             # from here the voicebox turns red and pulses; a c
 on_limit = "transcribe"       # "transcribe" or "discard" when the limit is reached
 sounds = true                 # start/stop/warning tones
 duck = 0.30                   # loudness of playing media while recording (0-1, 1 = off)
+fade = 0.3                   # seconds the volume takes to go down/up (0 = instant)
 paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
 margin = 110                  # px from the screen edge
@@ -124,37 +125,63 @@ def get_volume():
     return float(out.split()[1])
 
 
-def duck(level):
+_fade_gen = 0  # a newer fade cancels an older one still running
+
+
+def sink_inputs():
+    return json.loads(subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
+                                     capture_output=True, text=True).stdout or "[]")
+
+
+def fade(moves, seconds):
+    """Slide streams {index: (from_vols, to_vols)} in 5% steps in the background."""
+    global _fade_gen
+    _fade_gen += 1
+    gen, step = _fade_gen, 65536 * 5 // 100
+    steps = max([1] + [math.ceil(abs(y - x) / step) for a, b in moves.values() for x, y in zip(a, b)])
+
+    def run():
+        for i in range(1, steps + 1):
+            if gen != _fade_gen:
+                return
+            for idx, (a, b) in moves.items():
+                vols = [min(x + step * i, y) if y > x else max(x - step * i, y) for x, y in zip(a, b)]
+                subprocess.run(["pactl", "set-sink-input-volume", str(idx), *map(str, vols)],
+                               stderr=subprocess.DEVNULL)
+            if i < steps:
+                time.sleep(seconds / steps)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def duck(level, seconds=0):
     """Turn playing apps down (not the system volume, so Plasma shows no OSD) until unduck()."""
     if level >= 1 or DUCK_FILE.exists():
         return
     factor = min(1.0, level / max(get_volume(), 0.01))
     if factor >= 1:
         return
-    streams = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
-                                        capture_output=True, text=True).stdout or "[]")
-    saved = {}  # keyed by app name: apps reopen streams (new index) and WirePlumber remembers per-app volume
-    for st in streams:
+    saved, moves = {}, {}  # keyed by app name: apps reopen streams (new index) and WirePlumber remembers per-app volume
+    for st in sink_inputs():
         if st["properties"].get("application.process.id") == str(os.getpid()):
             continue
         vols = [ch["value"] for ch in st["volume"].values()]
         saved.setdefault(st["properties"].get("application.name", ""), vols)
-        subprocess.run(["pactl", "set-sink-input-volume", str(st["index"]), *[str(int(v * factor)) for v in vols]])
+        moves[st["index"]] = (vols, [int(v * factor) for v in vols])
     DUCK_FILE.write_text(json.dumps(saved))  # survives a crash, restored on next start
+    fade(moves, seconds)
 
 
-def unduck():
+def unduck(seconds=0):
     if not DUCK_FILE.exists():
         return
     saved = json.loads(DUCK_FILE.read_text())
-    streams = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
-                                        capture_output=True, text=True).stdout or "[]")
-    for st in streams:  # current streams, including ones the app reopened while ducked
+    moves = {}
+    for st in sink_inputs():  # current streams, including ones the app reopened while ducked
         vols = saved.get(st["properties"].get("application.name", ""))
         if vols:
-            subprocess.run(["pactl", "set-sink-input-volume", str(st["index"]), *map(str, vols)],
-                           stderr=subprocess.DEVNULL)
+            moves[st["index"]] = ([ch["value"] for ch in st["volume"].values()], vols)
     DUCK_FILE.unlink()
+    fade(moves, seconds)
 
 
 def post_wav(port, path, language):
@@ -376,7 +403,7 @@ def run_daemon():
             self.clock.start()
             self.box.set_state("listening")
             self.play("start")
-            QTimer.singleShot(250, lambda: duck(cfg["duck"]) if self.rec else None)
+            QTimer.singleShot(250, lambda: duck(cfg["duck"], cfg["fade"]) if self.rec else None)
 
         def on_audio(self):
             data = bytes(self.rec.readAllStandardOutput())
@@ -417,7 +444,7 @@ def run_daemon():
                 return
             self.end_recording()
             self.raw_path.unlink(missing_ok=True)
-            unduck()
+            unduck(cfg["fade"])
             self.play("stop")
             self.box.set_state("error")
 
@@ -427,7 +454,7 @@ def run_daemon():
             self.end_recording()
             self.play("stop")
             if self.peak_db < -50:  # nothing but silence: Whisper would only invent text
-                unduck()
+                unduck(cfg["fade"])
                 self.box.set_state("error")
                 return
             wav = CACHE / "last.wav"  # kept until the next recording, so nothing is lost on failure
@@ -454,7 +481,7 @@ def run_daemon():
 
         def on_transcribed(self, text, error):
             self.busy = False
-            unduck()
+            unduck(cfg["fade"])
             if error or not text:
                 print("transcription failed:", error or "empty result", file=sys.stderr)
                 self.play("error")
