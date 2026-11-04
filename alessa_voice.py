@@ -133,12 +133,12 @@ def duck(level):
         return
     streams = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
                                         capture_output=True, text=True).stdout or "[]")
-    saved = {}
+    saved = {}  # keyed by app name: apps reopen streams (new index) and WirePlumber remembers per-app volume
     for st in streams:
         if st["properties"].get("application.process.id") == str(os.getpid()):
             continue
         vols = [ch["value"] for ch in st["volume"].values()]
-        saved[st["index"]] = vols
+        saved.setdefault(st["properties"].get("application.name", ""), vols)
         subprocess.run(["pactl", "set-sink-input-volume", str(st["index"]), *[str(int(v * factor)) for v in vols]])
     DUCK_FILE.write_text(json.dumps(saved))  # survives a crash, restored on next start
 
@@ -146,9 +146,14 @@ def duck(level):
 def unduck():
     if not DUCK_FILE.exists():
         return
-    for idx, vols in json.loads(DUCK_FILE.read_text()).items():
-        subprocess.run(["pactl", "set-sink-input-volume", idx, *map(str, vols)],
-                       stderr=subprocess.DEVNULL)  # the stream may be gone by now
+    saved = json.loads(DUCK_FILE.read_text())
+    streams = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
+                                        capture_output=True, text=True).stdout or "[]")
+    for st in streams:  # current streams, including ones the app reopened while ducked
+        vols = saved.get(st["properties"].get("application.name", ""))
+        if vols:
+            subprocess.run(["pactl", "set-sink-input-volume", str(st["index"]), *map(str, vols)],
+                           stderr=subprocess.DEVNULL)
     DUCK_FILE.unlink()
 
 
