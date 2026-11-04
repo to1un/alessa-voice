@@ -49,7 +49,7 @@ In *System Settings → Keyboard → Shortcuts → Add New → Command*, bind `a
 | `alessa-voice cancel` | discard the recording |
 | `alessa-voice models` | list local models |
 
-Settings are in `~/.config/alessa-voice/config.toml`, created on first run. The default language is Turkish (`language = "tr"`); set `"en"` or `"auto"`. Other settings: model, recording limit (60 min) and warning, media volume while recording and its fade time, position, sounds.
+Settings are in `~/.config/alessa-voice/config.toml`, created on first run. The default language is Turkish (`language = "tr"`); set `"en"` or `"auto"`. Other settings: model, recording limit (60 min) and warning, system volume while recording and its fade time, position, sounds.
 
 The last recording is kept in `~/.cache/alessa-voice/last.wav` until the next one.
 

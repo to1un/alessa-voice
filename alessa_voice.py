@@ -40,7 +40,7 @@ max_minutes = 60              # recording limit
 warn_minutes = 50             # from here the voicebox turns red and pulses; a chime at limit-5
 on_limit = "transcribe"       # "transcribe" or "discard" when the limit is reached
 sounds = true                 # start/stop/warning tones
-duck = 0.30                   # loudness of playing media while recording (0-1, 1 = off)
+duck = 0.30                   # system volume while recording (0-1, 1 = off)
 fade = 0.3                   # seconds the volume takes to go down/up (0 = instant)
 paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
@@ -126,62 +126,53 @@ def get_volume():
 
 
 _fade_gen = 0  # a newer fade cancels an older one still running
+_fading = False
 
 
-def sink_inputs():
-    return json.loads(subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"],
-                                     capture_output=True, text=True).stdout or "[]")
-
-
-def fade(moves, seconds):
-    """Slide streams {index: (from_vols, to_vols)} in 5% steps in the background."""
-    global _fade_gen
+def fade(start, end, seconds):
+    """Slide the system volume from start to end in 5% steps in the background."""
+    global _fade_gen, _fading
     _fade_gen += 1
-    gen, step = _fade_gen, 65536 * 5 // 100
-    steps = max([1] + [math.ceil(abs(y - x) / step) for a, b in moves.values() for x, y in zip(a, b)])
+    gen, steps = _fade_gen, max(1, math.ceil(round(abs(end - start), 4) / 0.05))
+    _fading = True
 
     def run():
+        global _fading
         for i in range(1, steps + 1):
             if gen != _fade_gen:
                 return
-            for idx, (a, b) in moves.items():
-                vols = [min(x + step * i, y) if y > x else max(x - step * i, y) for x, y in zip(a, b)]
-                subprocess.run(["pactl", "set-sink-input-volume", str(idx), *map(str, vols)],
-                               stderr=subprocess.DEVNULL)
+            v = min(start + 0.05 * i, end) if end > start else max(start - 0.05 * i, end)
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{v:.2f}"])
             if i < steps:
                 time.sleep(seconds / steps)
+        _fading = False
     threading.Thread(target=run, daemon=True).start()
 
 
 def duck(level, seconds=0):
-    """Turn playing apps down (not the system volume, so Plasma shows no OSD) until unduck()."""
+    """Turn the system volume down to level while recording, until unduck()."""
     if level >= 1 or DUCK_FILE.exists():
         return
-    factor = min(1.0, level / max(get_volume(), 0.01))
-    if factor >= 1:
+    before = get_volume()
+    if before <= level:
         return
-    saved, moves = {}, {}  # keyed by app name: apps reopen streams (new index) and WirePlumber remembers per-app volume
-    for st in sink_inputs():
-        if st["properties"].get("application.process.id") == str(os.getpid()):
-            continue
-        vols = [ch["value"] for ch in st["volume"].values()]
-        saved.setdefault(st["properties"].get("application.name", ""), vols)
-        moves[st["index"]] = (vols, [int(v * factor) for v in vols])
-    DUCK_FILE.write_text(json.dumps(saved))  # survives a crash, restored on next start
-    fade(moves, seconds)
+    DUCK_FILE.write_text(json.dumps({"before": before, "ducked": level}))  # survives a crash, restored on next start
+    fade(before, level, seconds)
 
 
 def unduck(seconds=0):
     if not DUCK_FILE.exists():
         return
-    saved = json.loads(DUCK_FILE.read_text())
-    moves = {}
-    for st in sink_inputs():  # current streams, including ones the app reopened while ducked
-        vols = saved.get(st["properties"].get("application.name", ""))
-        if vols:
-            moves[st["index"]] = ([ch["value"] for ch in st["volume"].values()], vols)
+    try:
+        saved = json.loads(DUCK_FILE.read_text())
+        before, ducked = saved["before"], saved["ducked"]
+    except (ValueError, KeyError, TypeError):  # unreadable or an old format
+        DUCK_FILE.unlink()
+        return
     DUCK_FILE.unlink()
-    fade(moves, seconds)
+    now = get_volume()
+    if _fading or abs(now - ducked) < 0.01:  # otherwise the volume keys were used while recording: keep that
+        fade(now, before, seconds)
 
 
 def post_wav(port, path, language):
@@ -439,22 +430,24 @@ def run_daemon():
             self.raw.close()
             self.rec = None
 
+        def unduck_then_stop_tone(self):
+            unduck(cfg["fade"])  # the tone plays at full volume, after the fade up
+            QTimer.singleShot(int(cfg["fade"] * 1000), lambda: self.play("stop"))
+
         def cancel(self):
             if not self.rec:
                 return
             self.end_recording()
             self.raw_path.unlink(missing_ok=True)
-            unduck(cfg["fade"])
-            self.play("stop")
+            self.unduck_then_stop_tone()
             self.box.set_state("error")
 
         def stop(self):
             if not self.rec:
                 return
             self.end_recording()
-            self.play("stop")
+            self.unduck_then_stop_tone()
             if self.peak_db < -50:  # nothing but silence: Whisper would only invent text
-                unduck(cfg["fade"])
                 self.box.set_state("error")
                 return
             wav = CACHE / "last.wav"  # kept until the next recording, so nothing is lost on failure
@@ -481,7 +474,6 @@ def run_daemon():
 
         def on_transcribed(self, text, error):
             self.busy = False
-            unduck(cfg["fade"])
             if error or not text:
                 print("transcription failed:", error or "empty result", file=sys.stderr)
                 self.play("error")
