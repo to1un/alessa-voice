@@ -38,7 +38,7 @@ git clone https://github.com/to1un/alessa-voice ~/projects/alessa-voice
 ln -s ~/projects/alessa-voice/alessa_voice.py ~/.local/bin/alessa-voice
 ```
 
-In *System Settings → Keyboard → Shortcuts → Add New → Command*, bind `alessa-voice toggle` (e.g. F8) and `alessa-voice cancel` (e.g. Ctrl+F8). Add `alessa-voice` to *Autostart*.
+In *System Settings → Keyboard → Shortcuts → Add New → Command*, bind `alessa-voice toggle tr` (F7, Turkish), `alessa-voice toggle en` (F8, English) and `alessa-voice cancel` (Ctrl+F7 / Ctrl+F8). The key that starts a recording sets its language. Add `alessa-voice` to *Autostart*.
 
 ## Usage
 

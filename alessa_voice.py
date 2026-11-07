@@ -3,7 +3,7 @@
 
 Usage:
   alessa-voice            run the daemon (overlay + whisper-server)
-  alessa-voice toggle     start / stop recording
+  alessa-voice toggle [tr|en]  start / stop recording (the language is set by the starting key)
   alessa-voice cancel     discard the current recording
   alessa-voice models     list available local models
 """
@@ -374,10 +374,14 @@ def run_daemon():
         def on_conn(self):
             c = self.ipc.nextPendingConnection()
             c.waitForReadyRead(500)
-            cmd = bytes(c.readAll()).decode().strip()
+            cmd, _, lang = bytes(c.readAll()).decode().strip().partition(" ")
             c.disconnectFromServer()
             if cmd == "toggle":
-                self.stop() if self.rec else self.start()
+                if self.rec:
+                    self.stop()
+                else:
+                    self.lang = lang or cfg["language"]  # the key that starts the recording picks the language
+                    self.start()
             elif cmd == "cancel":
                 self.cancel()
 
@@ -467,7 +471,7 @@ def run_daemon():
                     if server.poll() is not None:
                         raise RuntimeError("whisper-server exited, see ~/.cache/alessa-voice/whisper-server.log")
                     time.sleep(0.3)
-                text = drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, cfg["language"])))
+                text = drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, self.lang)))
                 self.transcribed.emit(text, "")
             except Exception as e:
                 self.transcribed.emit("", str(e))
@@ -505,6 +509,8 @@ def main():
     if cmd == "daemon":
         run_daemon()
     elif cmd in ("toggle", "cancel"):
+        if cmd == "toggle" and len(sys.argv) > 2:
+            cmd += " " + sys.argv[2]
         if not send(cmd):
             sys.exit("alessa-voice daemon is not running")
     elif cmd == "models":
