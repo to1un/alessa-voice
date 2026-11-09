@@ -46,6 +46,8 @@ paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
 margin = 110                  # px from the screen edge
 port = 45556                  # local whisper-server port
+prompt_tr = "Şunu yap, bunu belirt, incele. Eklemek istediğin bir şey var mı? SIEM, SOC, Alessa."
+prompt_en = "SIEM, SOC, Alessa, cybersecurity."
 """
 
 
@@ -175,14 +177,16 @@ def unduck(seconds=0):
         fade(now, before, seconds)
 
 
-def post_wav(port, path, language):
+def post_wav(port, path, language, prompt=""):
     boundary = uuid.uuid4().hex
     fields = {"response_format": "json", "temperature": "0.0"}
     if language != "auto":
         fields["language"] = language
+    if prompt:
+        fields["prompt"] = prompt
     body = b""
     for k, v in fields.items():
-        body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode("utf-8")
     body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\n'
              "Content-Type: audio/wav\r\n\r\n").encode()
     body += Path(path).read_bytes() + f"\r\n--{boundary}--\r\n".encode()
@@ -471,7 +475,8 @@ def run_daemon():
                     if server.poll() is not None:
                         raise RuntimeError("whisper-server exited, see ~/.cache/alessa-voice/whisper-server.log")
                     time.sleep(0.3)
-                text = drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, self.lang)))
+                prompt = cfg.get(f"prompt_{self.lang}", cfg.get("prompt", ""))
+                text = drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, self.lang, prompt)))
                 self.transcribed.emit(text, "")
             except Exception as e:
                 self.transcribed.emit("", str(e))
