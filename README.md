@@ -34,8 +34,8 @@ curl -L -o ~/.local/share/whisper/vad/ggml-silero-v5.1.2.bin https://huggingface
 Install alessa-voice:
 
 ```bash
-git clone https://github.com/to1un/alessa-voice ~/projects/alessa-voice
-ln -s ~/projects/alessa-voice/alessa_voice.py ~/.local/bin/alessa-voice
+git clone https://github.com/to1un/alessa-voice ~/workspace/projects/alessa-voice
+ln -s ~/workspace/projects/alessa-voice/alessa_voice.py ~/.local/bin/alessa-voice
 ```
 
 In *System Settings → Keyboard → Shortcuts → Add New → Command*, bind `alessa-voice toggle tr` (F7, Turkish), `alessa-voice toggle en` (F8, English) and `alessa-voice cancel` (Ctrl+F7 / Ctrl+F8). The key that starts a recording sets its language. Add `alessa-voice` to *Autostart*.
