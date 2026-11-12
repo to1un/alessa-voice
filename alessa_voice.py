@@ -48,6 +48,8 @@ paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
 margin = 110                  # px from the screen edge
 port = 45556                  # local whisper-server port
+port_en = 45557               # dedicated whisper-server port for English (distil)
+model_en = "ggml-distil-large-v3.bin" # dedicated English model
 streaming = true              # stream sentences on natural speech pauses
 silence_ms = 600              # ms pause to trigger sentence paste
 min_chunk_s = 1.0             # minimum speech seconds before chunking
@@ -254,9 +256,19 @@ def run_daemon():
          "--vad", "-vm", str(MODEL_DIR / "vad/ggml-silero-v5.1.2.bin"), "-vt", "0.35", "-vp", "400", "-vsd", "300"],
         stdout=open(CACHE / "whisper-server.log", "w"), stderr=subprocess.STDOUT)
 
-    def server_ready():
+    server_en = None
+    model_en_path = MODEL_DIR / cfg.get("model_en", "ggml-distil-large-v3.bin")
+    if model_en_path.exists():
+        server_en = subprocess.Popen(
+            ["whisper-server", "-m", str(model_en_path), "--host", "127.0.0.1",
+             "--port", str(cfg.get("port_en", 45557)), "-l", "en", "-mc", "0", "-sns",
+             "--vad", "-vm", str(MODEL_DIR / "vad/ggml-silero-v5.1.2.bin"), "-vt", "0.35", "-vp", "400", "-vsd", "300"],
+            stdout=open(CACHE / "whisper-server-en.log", "w"), stderr=subprocess.STDOUT)
+
+    def server_ready(port=None):
+        p = port or cfg["port"]
         try:
-            with socket.create_connection(("127.0.0.1", cfg["port"]), timeout=0.5):
+            with socket.create_connection(("127.0.0.1", p), timeout=0.5):
                 return True
         except OSError:
             return False
@@ -494,8 +506,11 @@ def run_daemon():
                     break
                 if action == "chunk" and audio_bytes:
                     try:
-                        while not server_ready():
-                            if server.poll() is not None:
+                        use_en = (lang == "en" and server_en is not None)
+                        target_port = cfg.get("port_en", 45557) if use_en else cfg["port"]
+                        target_server = server_en if use_en else server
+                        while not server_ready(target_port):
+                            if target_server.poll() is not None:
                                 raise RuntimeError("whisper-server exited")
                             time.sleep(0.2)
                         chunk_wav = CACHE / f"chunk_{seq}.wav"
@@ -504,7 +519,7 @@ def run_daemon():
                             w.setsampwidth(2)
                             w.setframerate(RATE)
                             w.writeframes(audio_bytes)
-                        raw_text = post_wav(cfg["port"], chunk_wav, lang)
+                        raw_text = post_wav(target_port, chunk_wav, lang)
                         chunk_wav.unlink(missing_ok=True)
                         cleaned = apply_dictionary(drop_hallucinations(collapse_repeats(raw_text))).strip()
                         if cleaned:
@@ -603,11 +618,14 @@ def run_daemon():
 
         def transcribe(self, wav):
             try:
-                while not server_ready():
-                    if server.poll() is not None:
+                use_en = (self.lang == "en" and server_en is not None)
+                target_port = cfg.get("port_en", 45557) if use_en else cfg["port"]
+                target_server = server_en if use_en else server
+                while not server_ready(target_port):
+                    if target_server.poll() is not None:
                         raise RuntimeError("whisper-server exited, see ~/.cache/alessa-voice/whisper-server.log")
                     time.sleep(0.3)
-                text = apply_dictionary(drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, self.lang))))
+                text = apply_dictionary(drop_hallucinations(collapse_repeats(post_wav(target_port, wav, self.lang))))
                 self.transcribed.emit(text, "")
             except Exception as e:
                 self.transcribed.emit("", str(e))
@@ -637,6 +655,8 @@ def run_daemon():
         app.exec()
     finally:
         server.terminate()
+        if server_en:
+            server_en.terminate()
         del daemon
 
 
