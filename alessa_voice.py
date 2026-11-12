@@ -47,6 +47,7 @@ fade = 0.3                   # seconds the volume takes to go down/up (0 = insta
 paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
 margin = 110                  # px from the screen edge
+threads = 6                   # CPU computation threads (Ryzen 5600X physical cores)
 port = 45556                  # local whisper-server port
 port_en = 45557               # dedicated whisper-server port for English (distil)
 model_en = "ggml-distil-large-v3.bin" # dedicated English model
@@ -249,9 +250,10 @@ def run_daemon():
     for name, notes in tones.items():
         make_tone(CACHE / f"{name}.wav", notes)
 
+    threads_arg = ["-t", str(cfg.get("threads", 6))]
     server = subprocess.Popen(
         ["whisper-server", "-m", str(MODEL_DIR / cfg["model"]), "--host", "127.0.0.1",
-         "--port", str(cfg["port"]), "-l", cfg["language"], "-mc", "0", "-sns",
+         "--port", str(cfg["port"]), "-l", cfg["language"], "-mc", "0", "-sns"] + threads_arg + [
          # Silero VAD: only speech reaches Whisper, so silence can't turn into invented subtitles
          "--vad", "-vm", str(MODEL_DIR / "vad/ggml-silero-v5.1.2.bin"), "-vt", "0.35", "-vp", "400", "-vsd", "300"],
         stdout=open(CACHE / "whisper-server.log", "w"), stderr=subprocess.STDOUT)
@@ -261,7 +263,7 @@ def run_daemon():
     if model_en_path.exists():
         server_en = subprocess.Popen(
             ["whisper-server", "-m", str(model_en_path), "--host", "127.0.0.1",
-             "--port", str(cfg.get("port_en", 45557)), "-l", "en", "-mc", "0", "-sns",
+             "--port", str(cfg.get("port_en", 45557)), "-l", "en", "-mc", "0", "-sns"] + threads_arg + [
              "--vad", "-vm", str(MODEL_DIR / "vad/ggml-silero-v5.1.2.bin"), "-vt", "0.35", "-vp", "400", "-vsd", "300"],
             stdout=open(CACHE / "whisper-server-en.log", "w"), stderr=subprocess.STDOUT)
 
