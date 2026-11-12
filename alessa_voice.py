@@ -11,6 +11,7 @@ import array
 import json
 import math
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -26,6 +27,7 @@ from pathlib import Path
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 SOCK = RUNTIME / "alessa-voice.sock"
 CONFIG = Path.home() / ".config/alessa-voice/config.toml"
+DICTIONARY_FILE = Path.home() / ".config/alessa-voice/dictionary.toml"
 CACHE = Path.home() / ".cache/alessa-voice"
 MODEL_DIR = Path.home() / ".local/share/whisper"
 RATE = 16000
@@ -46,6 +48,9 @@ paste = true                  # paste at the cursor (false = clipboard only)
 position = "top"              # "top" or "bottom" centre of the screen
 margin = 110                  # px from the screen edge
 port = 45556                  # local whisper-server port
+streaming = true              # stream sentences on natural speech pauses
+silence_ms = 600              # ms pause to trigger sentence paste
+min_chunk_s = 1.0             # minimum speech seconds before chunking
 """
 
 
@@ -115,6 +120,27 @@ def collapse_repeats(text):
             continue
         out.append(p)
     return " ".join(out)
+
+
+def load_dictionary():
+    if not DICTIONARY_FILE.exists():
+        return {}
+    try:
+        data = tomllib.loads(DICTIONARY_FILE.read_text())
+        return data.get("replacements", {})
+    except Exception:
+        return {}
+
+
+def apply_dictionary(text):
+    reps = load_dictionary()
+    if not reps or not text:
+        return text
+    for pattern, replacement in reps.items():
+        escaped = re.escape(pattern)
+        regex = rf"\b{escaped}\b" if pattern[0].isalnum() and pattern[-1].isalnum() else escaped
+        text = re.sub(regex, replacement, text, flags=re.IGNORECASE)
+    return text
 
 
 DUCK_FILE = CACHE / "volume-before-duck"
@@ -348,6 +374,8 @@ def run_daemon():
 
     class Daemon(QObject):
         transcribed = pyqtSignal(str, str)  # text, error
+        stream_paste = pyqtSignal(str)       # text to paste immediately
+        stream_finished = pyqtSignal()      # when all streamed chunks are done
 
         def __init__(self):
             super().__init__()
@@ -361,6 +389,16 @@ def run_daemon():
             self.warned = False
             self.clock = QTimer(self, interval=1000, timeout=self.tick)
             self.transcribed.connect(self.on_transcribed)
+            self.stream_paste.connect(self.on_stream_paste)
+            self.stream_finished.connect(self.on_stream_finished)
+            self.stream_queue = None
+            self.stream_worker = None
+            self.chunk_buf = bytearray()
+            self.speech_bytes = 0
+            self.silence_bytes = 0
+            self.chunk_seq = 0
+            self.is_first_chunk = True
+            self.streaming_enabled = False
             self.ipc = QLocalServer(self)
             QLocalServer.removeServer(str(SOCK))
             self.ipc.listen(str(SOCK))
@@ -390,6 +428,16 @@ def run_daemon():
                 return
             self.raw = open(self.raw_path, "wb")
             self.peak_db, self.warned, self.box.warn, self.box.minutes_left = -120.0, False, 0.0, None
+            self.is_first_chunk = True
+            self.chunk_buf = bytearray()
+            self.speech_bytes = 0
+            self.silence_bytes = 0
+            self.chunk_seq = 0
+            self.streaming_enabled = cfg.get("streaming", True)
+            if self.streaming_enabled:
+                self.stream_queue = queue.Queue()
+                self.stream_worker = threading.Thread(target=self._run_stream_worker, daemon=True)
+                self.stream_worker.start()
             self.rec = QProcess(self)
             self.rec.readyReadStandardOutput.connect(self.on_audio)
             self.rec.start("parecord", ["--raw", "--format=s16le", f"--rate={RATE}", "--channels=1",
@@ -412,6 +460,72 @@ def run_daemon():
             target = min(1.0, max(0.0, (db + 52) / 34))
             k = 0.6 if target > self.box.level else 0.15  # fast attack, slow decay
             self.box.level += (target - self.box.level) * k
+
+            if self.streaming_enabled and self.stream_queue:
+                self.chunk_buf.extend(data)
+                if db >= -42.0:
+                    self.speech_bytes += len(data)
+                    self.silence_bytes = 0
+                else:
+                    self.silence_bytes += len(data)
+
+                bytes_per_sec = RATE * 2
+                silence_limit = int(bytes_per_sec * (cfg.get("silence_ms", 600) / 1000.0))
+                speech_min = int(bytes_per_sec * cfg.get("min_chunk_s", 1.0))
+                speech_max = int(bytes_per_sec * 12.0)
+
+                if (self.speech_bytes >= speech_min and self.silence_bytes >= silence_limit) or \
+                   (self.speech_bytes >= speech_max and self.silence_bytes >= int(bytes_per_sec * 0.25)):
+                    chunk_data = bytes(self.chunk_buf)
+                    self.chunk_buf = bytearray()
+                    self.speech_bytes = 0
+                    self.silence_bytes = 0
+                    self.chunk_seq += 1
+                    self.stream_queue.put(("chunk", self.chunk_seq, chunk_data, self.lang))
+
+        def _run_stream_worker(self):
+            while True:
+                item = self.stream_queue.get()
+                if item is None:
+                    break
+                action, seq, audio_bytes, lang = item
+                if action == "stop":
+                    self.stream_finished.emit()
+                    break
+                if action == "chunk" and audio_bytes:
+                    try:
+                        while not server_ready():
+                            if server.poll() is not None:
+                                raise RuntimeError("whisper-server exited")
+                            time.sleep(0.2)
+                        chunk_wav = CACHE / f"chunk_{seq}.wav"
+                        with wave.open(str(chunk_wav), "wb") as w:
+                            w.setnchannels(1)
+                            w.setsampwidth(2)
+                            w.setframerate(RATE)
+                            w.writeframes(audio_bytes)
+                        raw_text = post_wav(cfg["port"], chunk_wav, lang)
+                        chunk_wav.unlink(missing_ok=True)
+                        cleaned = apply_dictionary(drop_hallucinations(collapse_repeats(raw_text))).strip()
+                        if cleaned:
+                            self.stream_paste.emit(cleaned)
+                    except Exception as e:
+                        print(f"stream chunk {seq} error:", e, file=sys.stderr)
+
+        def on_stream_paste(self, text):
+            if not text:
+                return
+            to_paste = (" " + text) if not self.is_first_chunk else text
+            self.is_first_chunk = False
+            subprocess.run(["wl-copy"], input=to_paste.encode())
+            if cfg["paste"]:
+                time.sleep(0.08)
+                subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def on_stream_finished(self):
+            self.busy = False
+            self.box.set_state("done")
 
         def tick(self):
             mins = (time.monotonic() - self.started) / 60
@@ -444,6 +558,14 @@ def run_daemon():
             self.end_recording()
             self.raw_path.unlink(missing_ok=True)
             self.unduck_then_stop_tone()
+            if self.stream_queue:
+                while not self.stream_queue.empty():
+                    try:
+                        self.stream_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                self.stream_queue.put(None)
+                self.stream_queue = None
             self.box.set_state("error")
 
         def stop(self):
@@ -452,6 +574,9 @@ def run_daemon():
             self.end_recording()
             self.unduck_then_stop_tone()
             if self.peak_db < -50:  # nothing but silence: Whisper would only invent text
+                if self.stream_queue:
+                    self.stream_queue.put(None)
+                    self.stream_queue = None
                 self.box.set_state("error")
                 return
             wav = CACHE / "last.wav"  # kept until the next recording, so nothing is lost on failure
@@ -461,9 +586,20 @@ def run_daemon():
                 w.setframerate(RATE)
                 w.writeframes(self.raw_path.read_bytes())
             self.raw_path.unlink(missing_ok=True)
-            self.busy = True
-            self.box.set_state("thinking")
-            threading.Thread(target=self.transcribe, args=(wav,), daemon=True).start()
+
+            if self.streaming_enabled and self.stream_queue:
+                bytes_per_sec = RATE * 2
+                if self.speech_bytes >= int(bytes_per_sec * 0.25) and self.chunk_buf:
+                    self.chunk_seq += 1
+                    self.stream_queue.put(("chunk", self.chunk_seq, bytes(self.chunk_buf), self.lang))
+                self.chunk_buf = bytearray()
+                self.busy = True
+                self.box.set_state("thinking")
+                self.stream_queue.put(("stop", 0, b"", ""))
+            else:
+                self.busy = True
+                self.box.set_state("thinking")
+                threading.Thread(target=self.transcribe, args=(wav,), daemon=True).start()
 
         def transcribe(self, wav):
             try:
@@ -471,7 +607,7 @@ def run_daemon():
                     if server.poll() is not None:
                         raise RuntimeError("whisper-server exited, see ~/.cache/alessa-voice/whisper-server.log")
                     time.sleep(0.3)
-                text = drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, self.lang)))
+                text = apply_dictionary(drop_hallucinations(collapse_repeats(post_wav(cfg["port"], wav, self.lang))))
                 self.transcribed.emit(text, "")
             except Exception as e:
                 self.transcribed.emit("", str(e))
