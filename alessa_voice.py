@@ -50,7 +50,7 @@ margin = 110                  # px from the screen edge
 port = 45556                  # local whisper-server port
 port_en = 45557               # dedicated whisper-server port for English (distil)
 model_en = "ggml-distil-large-v3.bin" # dedicated English model
-streaming = true              # stream sentences on natural speech pauses
+streaming = false             # stream sentences on natural speech pauses
 silence_ms = 600              # ms pause to trigger sentence paste
 min_chunk_s = 1.0             # minimum speech seconds before chunking
 """
