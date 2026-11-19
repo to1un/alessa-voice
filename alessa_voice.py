@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import uuid
 import wave
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
@@ -52,12 +52,15 @@ groq_stt_model_en = "whisper-large-v3-turbo"
 groq_stt_model_to_en = "whisper-large-v3"
 
 cleanup = true                # LLM cleanup / translation pass after STT
+cleanup_style = "polish"      # "polish" (fluent spoken->written) or "light" (strict)
 groq_llm_models = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
 fallback_local = true         # run one-shot whisper-cli if Groq fails
 model = "ggml-large-v3.bin"
 model_en = "ggml-distil-large-v3.bin"
 threads = 6
+history_days = 7
+history_max = 100
 
 max_minutes = 60
 warn_minutes = 50
@@ -67,7 +70,7 @@ duck = 0.10
 fade = 0.3
 paste = true
 position = "bottom"           # "bottom" or "top" centre of the screen
-margin = 24                   # px from screen edge
+margin = 6                    # px from screen edge (or panel edge)
 """
 
 
@@ -178,9 +181,16 @@ HALLUCINATIONS = re.compile(
     r"abone ol|altyaz[ıi]|izledi[gğ]iniz i[cç]in te[sş]ekk|be[gğ]enmeyi unutmay|kanal[ıi]ma|"
     r"bir sonraki videoda|subtitles? by|thanks? for watching|amara\.org|please subscribe", re.I)
 
+HALLUCINATION_LOOP = re.compile(
+    r"(?:\b(?:abone ol|izledi[gğ]iniz i[cç]in te[sş]ekk(?:ür(?:ler)?)?|be[gğ]enmeyi unutmay(?:[ıi]n)?|"
+    r"kanal[ıi]ma abone ol|bir sonraki videoda|thanks? for watching|please subscribe)[.!?,…\s]*){2,}",
+    re.I,
+)
+
 
 def drop_hallucinations(text):
-    parts = re.split(r"(?<=[.!?…])\s+", text)
+    text = re.sub(HALLUCINATION_LOOP, " ", text)
+    parts = re.split(r"(?<=[.!?…])\s+", " ".join(text.split()))
     return " ".join(p for p in parts if not (HALLUCINATIONS.search(p) and len(p) < 60))
 
 
@@ -239,11 +249,33 @@ def apply_dictionary(text):
     return text
 
 
-def append_history(mode, engine, stt_ms, llm_ms, raw, cleaned):
+def append_history(mode, engine, stt_ms, llm_ms, raw, cleaned, cfg=None):
     try:
         CACHE.mkdir(parents=True, exist_ok=True)
+        max_entries = max(1, int((cfg or {}).get("history_max", 100)))
+        max_days = int((cfg or {}).get("history_days", 7))
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=max_days)) if max_days > 0 else None
+
+        kept = []
+        if HISTORY_FILE.exists():
+            for ln in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+                if not ln.strip():
+                    continue
+                try:
+                    prev = json.loads(ln)
+                    if cutoff is not None:
+                        dt = datetime.fromisoformat(prev["ts"])
+                        if dt.tzinfo is None:
+                            dt = dt.astimezone()
+                        if dt < cutoff:
+                            continue
+                    kept.append(json.dumps(prev, ensure_ascii=False))
+                except Exception:
+                    continue
+
         entry = {
-            "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "ts": now.astimezone().isoformat(timespec="seconds"),
             "mode": mode,
             "engine": engine,
             "stt_ms": int(stt_ms),
@@ -251,11 +283,8 @@ def append_history(mode, engine, stt_ms, llm_ms, raw, cleaned):
             "raw": raw,
             "cleaned": cleaned,
         }
-        lines = []
-        if HISTORY_FILE.exists():
-            lines = [ln for ln in HISTORY_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        lines.append(json.dumps(entry, ensure_ascii=False))
-        HISTORY_FILE.write_text("\n".join(lines[-100:]) + "\n", encoding="utf-8")
+        kept.append(json.dumps(entry, ensure_ascii=False))
+        HISTORY_FILE.write_text("\n".join(kept[-max_entries:]) + "\n", encoding="utf-8")
         os.chmod(HISTORY_FILE, 0o600)
     except OSError as e:
         print("history write failed:", e, file=sys.stderr)
@@ -369,23 +398,47 @@ def groq_transcribe(audio_path, mime, filename, mode, cfg, api_key):
         return json.loads(r.read())["text"].strip(), model
 
 
-def build_cleanup_prompt(mode, glossary):
+def build_cleanup_prompt(mode, glossary, style="polish"):
     if mode == "tr":
-        base = (
-            "You clean Turkish speech-to-text transcripts. Remove speech fillers "
-            "(şey, yani, hani, ıı, ee, işte) and immediate stutters or repeated words. "
-            "Fix punctuation, capitalization, and obvious phonetic speech recognition mistakes "
-            "while keeping English technical terms in English. Never summarize, omit sentences, "
-            "answer questions, or add new ideas. Output ONLY the cleaned Turkish text."
-        )
+        if style == "polish":
+            base = (
+                "Rewrite this Turkish speech-to-text transcript into clean, fluent, natural everyday Turkish "
+                "as if the speaker typed it themselves. Keep the speaker's casual personal tone (never stiff "
+                "or formal) and keep 100% of their distinct facts, preferences, names, and questions. "
+                "Remove speech fillers (şey, yani, hani, ıı, ee, işte), stutters, and thinking-out-loud "
+                "duplicates where the same point is repeated back-to-back while phrasing it (keep the clearest "
+                "phrasing once). Connect choppy spoken fragments into well-punctuated sentences, and fix obvious "
+                "phonetic STT mistakes on technical/English words from context (e.g. branch, merge, master, "
+                "on/off, common.md, STATE.md). Never summarize away details, never invent new meaning, and "
+                "never answer the speaker. Output ONLY the cleaned Turkish text."
+            )
+        else:
+            base = (
+                "You clean Turkish speech-to-text transcripts. Remove speech fillers "
+                "(şey, yani, hani, ıı, ee, işte) and immediate stutters or repeated words. "
+                "Fix punctuation, capitalization, and obvious phonetic speech recognition mistakes "
+                "while keeping English technical terms in English. Never summarize, omit sentences, "
+                "answer questions, or add new ideas. Output ONLY the cleaned Turkish text."
+            )
     elif mode == "en":
-        base = (
-            "You clean English speech-to-text transcripts. Remove speech fillers "
-            "(um, uh, like, you know, I mean) and immediate stutters or repeated words. "
-            "Fix punctuation, capitalization, and obvious phonetic speech recognition mistakes. "
-            "Never summarize, omit sentences, answer questions, or add new ideas. "
-            "Output ONLY the cleaned English text."
-        )
+        if style == "polish":
+            base = (
+                "Rewrite this English speech-to-text transcript into clean, fluent, natural everyday English "
+                "as if the speaker typed it themselves. Keep the speaker's casual personal tone and keep 100% "
+                "of their distinct facts, preferences, names, and questions. Remove speech fillers (um, uh, like, "
+                "you know, I mean), stutters, and thinking-out-loud duplicates where the same point is repeated "
+                "back-to-back while phrasing it (keep the clearest phrasing once). Connect choppy spoken fragments "
+                "into well-punctuated sentences and fix obvious phonetic STT errors. Never summarize away details, "
+                "never invent new meaning, and never answer the speaker. Output ONLY the cleaned English text."
+            )
+        else:
+            base = (
+                "You clean English speech-to-text transcripts. Remove speech fillers "
+                "(um, uh, like, you know, I mean) and immediate stutters or repeated words. "
+                "Fix punctuation, capitalization, and obvious phonetic speech recognition mistakes. "
+                "Never summarize, omit sentences, answer questions, or add new ideas. "
+                "Output ONLY the cleaned English text."
+            )
     else:
         base = (
             "You clean and translate Turkish, English, or mixed Turkish-English speech-to-text "
@@ -403,7 +456,8 @@ def build_cleanup_prompt(mode, glossary):
 
 
 def groq_cleanup(text, mode, glossary, cfg, api_key):
-    system_prompt = build_cleanup_prompt(mode, glossary)
+    style = str(cfg.get("cleanup_style", "polish")).strip().lower()
+    system_prompt = build_cleanup_prompt(mode, glossary, style=style)
     models = cfg.get("groq_llm_models") or ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
     max_tokens = max(512, min(4096, int(len(text) * 1.8) + 128))
 
@@ -505,8 +559,8 @@ def build_wave_box(cfg, lsq=None):
     from PyQt6.QtWidgets import QApplication, QWidget
 
     class OrganicWaveBox(QWidget):
-        """Frameless Concept #2 (Organik Dalga): 3 Gaussian-tapered silky sine ribbons + floating label."""
-        W, H = 360, 96
+        """Frameless Concept #2 (Organik Dalga): 3 Gaussian-tapered silky sine ribbons (label-free, panel-safe)."""
+        W, H = 360, 72
         W_WAVE = 320
         STEP = 3
 
@@ -533,18 +587,18 @@ def build_wave_box(cfg, lsq=None):
             win = ctypes.c_void_p(lsq._ZN12LayerShellQt6Window3getEP7QWindow(
                 ctypes.c_void_p(sip.unwrapinstance(self.windowHandle()))))
             top = cfg.get("position", "bottom") == "top"
-            margin = int(cfg.get("margin", 24))
+            margin = int(cfg.get("margin", 6))
             margins = (ctypes.c_int * 4)(0, margin if top else 0, 0, 0 if top else margin)
             lsq._ZN12LayerShellQt6Window8setLayerENS0_5LayerE(win, 3)                     # overlay
             lsq._ZN12LayerShellQt6Window10setAnchorsE6QFlagsINS0_6AnchorEE(win, 1 if top else 2)
             lsq._ZN12LayerShellQt6Window10setMarginsERK8QMargins(win, margins)
             lsq._ZN12LayerShellQt6Window24setKeyboardInteractivityENS0_21KeyboardInteractivityE(win, 0)
-            lsq._ZN12LayerShellQt6Window16setExclusiveZoneEi(win, -1)                  # ignore panels
+            lsq._ZN12LayerShellQt6Window16setExclusiveZoneEi(win, 0)                   # respect KDE panels
 
         def place(self):
-            geo = QApplication.primaryScreen().geometry()
+            geo = QApplication.primaryScreen().availableGeometry()
             top = cfg.get("position", "bottom") == "top"
-            margin = int(cfg.get("margin", 24))
+            margin = int(cfg.get("margin", 6))
             y = geo.top() + margin if top else geo.bottom() - self.H - margin
             self.move(geo.center().x() - self.W // 2, y)
 
@@ -569,16 +623,6 @@ def build_wave_box(cfg, lsq=None):
             primary, glow, deep, _ = MODE_PALETTES.get(self.mode, MODE_PALETTES["tr"])
             return primary, glow, deep
 
-        def _caption(self):
-            base = MODE_PALETTES.get(self.mode, MODE_PALETTES["tr"])[3]
-            if self.minutes_left is not None:
-                return f"{base} · {self.minutes_left}m"
-            if self.state == "groq":
-                return f"{base} · STT"
-            if self.state == "cleaning":
-                return f"{base} · LLM"
-            return base
-
         def render_to(self, p):
             now = time.monotonic()
             t = now - self.t0
@@ -597,7 +641,7 @@ def build_wave_box(cfg, lsq=None):
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setOpacity(alpha)
 
-            cx, cy = self.W / 2.0, 38.0
+            cx, cy = self.W / 2.0, self.H / 2.0
             half = self.W_WAVE / 2.0
             xs = list(range(-int(half), int(half) + 1, self.STEP))
             envs = [math.exp(-((dx / half) / 0.46) ** 2) for dx in xs]
@@ -715,16 +759,17 @@ def build_wave_box(cfg, lsq=None):
                     p.setBrush(cg)
                     p.drawEllipse(QPointF(px, cy), 32.0, 32.0)
 
-            f = QFont("sans-serif", 10, QFont.Weight.DemiBold)
-            f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.4)
-            p.setFont(f)
-            caption = self._caption()
-            rect = QRectF(0, cy + 20, self.W, 24)
-            p.setPen(QColor(8, 12, 22, 165))
-            for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                p.drawText(rect.translated(ox, oy), Qt.AlignmentFlag.AlignCenter, caption)
-            p.setPen(QColor(248, 250, 252, 244))
-            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, caption)
+            if self.minutes_left is not None:
+                f = QFont("sans-serif", 9, QFont.Weight.DemiBold)
+                f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+                p.setFont(f)
+                caption = f"{self.minutes_left}m"
+                rect = QRectF(0, cy + 12, self.W, 20)
+                p.setPen(QColor(8, 12, 22, 165))
+                for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    p.drawText(rect.translated(ox, oy), Qt.AlignmentFlag.AlignCenter, caption)
+                p.setPen(QColor(254, 226, 226, 244))
+                p.drawText(rect, Qt.AlignmentFlag.AlignCenter, caption)
 
         def paintEvent(self, _):
             p = QPainter(self)
@@ -935,7 +980,7 @@ def run_daemon():
                     llm_ms = (time.monotonic() - llm_t0) * 1000.0
                     final_text = apply_dictionary(cleaned_llm).strip()
 
-                append_history(mode, f"{stt_engine}+{llm_engine}", stt_ms, llm_ms, raw_clean, final_text)
+                append_history(mode, f"{stt_engine}+{llm_engine}", stt_ms, llm_ms, raw_clean, final_text, cfg=cfg)
                 self.transcribed.emit(final_text, "")
             except Exception as e:
                 self.transcribed.emit("", str(e))
