@@ -52,7 +52,7 @@ groq_stt_model_en = "whisper-large-v3-turbo"
 groq_stt_model_to_en = "whisper-large-v3"
 
 cleanup = true                # LLM cleanup / translation pass after STT
-cleanup_style = "polish"      # "polish" (fluent spoken->written) or "light" (strict)
+cleanup_style = "light"       # "light" (strict) or "polish" (fluent spoken->written)
 groq_llm_models = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
 fallback_local = true         # run one-shot whisper-cli if Groq fails
@@ -364,7 +364,7 @@ def encode_ogg(wav_path, ogg_path):
     return wav_path, "audio/wav", "audio.wav"
 
 
-def groq_transcribe(audio_path, mime, filename, mode, cfg, api_key):
+def groq_transcribe(audio_path, mime, filename, mode, cfg, api_key, glossary=None):
     model = {
         "en": cfg["groq_stt_model_en"],
         "tr": cfg["groq_stt_model_tr"],
@@ -373,6 +373,8 @@ def groq_transcribe(audio_path, mime, filename, mode, cfg, api_key):
     fields = {"model": model, "response_format": "json", "temperature": "0.0"}
     if mode in ("en", "tr"):
         fields["language"] = mode
+    if glossary:
+        fields["prompt"] = ", ".join(glossary[:40])
 
     boundary = uuid.uuid4().hex
     body = bytearray()
@@ -937,6 +939,7 @@ def run_daemon():
                 api_key = load_groq_api_key(cfg)
                 backend = cfg.get("backend", "groq")
                 stt_t0 = time.monotonic()
+                glossary = load_glossary()
                 stt_engine = ""
                 raw_text = ""
 
@@ -944,7 +947,7 @@ def run_daemon():
                     ogg = CACHE / "last.ogg"
                     try:
                         upload_path, mime, fname = encode_ogg(wav, ogg)
-                        raw_text, stt_model = groq_transcribe(upload_path, mime, fname, mode, cfg, api_key)
+                        raw_text, stt_model = groq_transcribe(upload_path, mime, fname, mode, cfg, api_key, glossary=glossary)
                         stt_engine = f"groq:{stt_model}"
                     except Exception as e:
                         print("groq_transcribe failed:", e, file=sys.stderr)
@@ -976,7 +979,7 @@ def run_daemon():
                 if cfg.get("cleanup", True) and api_key and pre_dict:
                     self.stage_changed.emit("cleaning")
                     llm_t0 = time.monotonic()
-                    cleaned_llm, llm_engine = groq_cleanup(pre_dict, mode, load_glossary(), cfg, api_key)
+                    cleaned_llm, llm_engine = groq_cleanup(pre_dict, mode, glossary, cfg, api_key)
                     llm_ms = (time.monotonic() - llm_t0) * 1000.0
                     final_text = apply_dictionary(cleaned_llm).strip()
 
